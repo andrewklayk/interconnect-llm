@@ -13,10 +13,10 @@ Two design points that the ergodicity analysis depends on:
   instruction level alone and the closed loop is a finite Markov chain.  With
   ``alpha < 1`` the state becomes the hybrid pair ``(k, y)`` and the finite-state
   certificates in ``guarantees.markov`` no longer apply.
-* ``number_of_agents`` is the number of LLM samples averaged per step, and it
-  controls how much noise drives the loop.  Large values average the sampling
-  noise away and can make the chain effectively deterministic (and possibly
-  reducible); small values keep it comfortably irreducible.
+* ``number_of_agents`` is the number of LLM samples averaged per step.  Every run
+  in ``examples/llm_poc`` uses the default of 1, so the sampling noise reaches the
+  controller undiminished and the observation law is the pool itself rather than a
+  mean over it.
 """
 
 import torch
@@ -73,7 +73,8 @@ class LLMSim(Simulation):
 
     def __init__(self, reference_signal=0.0, weights=None, agent_logic=None,
                  number_of_agents=1, num_levels=NUM_LEVELS, tau=0.25,
-                 initial_level=None, alpha=1.0, loop_gain=1.0):
+                 tau_offset=0.0, initial_level=None, alpha=1.0, loop_gain=1.0,
+                 polarity=+1):
         super().__init__()
         if agent_logic is None:
             raise ValueError(
@@ -85,8 +86,8 @@ class LLMSim(Simulation):
         refsig.set_reference_signal(torch.tensor(float(reference_signal)))
         agg1 = Aggregator(name="A1", logic=self.AggregatorErrorLogic())
         cont = Controller(name="C", logic=IfElseLadderLogic(
-            num_levels=num_levels, tau=tau, initial_level=initial_level,
-            loop_gain=loop_gain))
+            num_levels=num_levels, tau=tau, tau_offset=tau_offset,
+            initial_level=initial_level, loop_gain=loop_gain, polarity=polarity))
         pop1 = Population(name="P1", logic=agent_logic, number_of_agents=number_of_agents)
         agg2 = Aggregator(name="A2", logic=self.AggregatorPassLogic())
         delay = Delay(name="Z", logic=ESDelayLogic(alpha=alpha))

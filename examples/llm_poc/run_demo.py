@@ -50,10 +50,15 @@ def scan_tau(pools, number_of_agents, grid, min_mass=0.02):
     putting real mass on more than one rung.  Selecting for spread alone is a
     trap: it drives tau to 0, removing the hold band and leaving a period-2 chain
     with no minorization at all.
+
+    The dead zone here is symmetric about the reference by design.  The
+    controller also supports an off-centre band via ``tau_offset``, but shifting
+    it means regulating to the centre of the band rather than to ``r = 0``, so
+    the main experiment does not use it; the counterexample runs do.
     """
-    print(f"\n{'tau':>6} {'uniq':>5} {'aper':>5} {'eps':>7} {'m':>3} {'mix':>7} "
-          f"{'H(pi)':>6} {'#rungs':>7}  stationary pi")
-    print("-" * 96)
+    print(f"\n{'tau':>6} {'uniq':>5} {'aper':>5} {'eps':>7} {'m':>3} {'in-class':>8} "
+          f"{'total':>6} {'H(pi)':>6} {'#rungs':>7}  stationary pi")
+    print("-" * 104)
     rows = []
     for tau in grid:
         P, up, dn = transition_law_from_pools(pools, tau,
@@ -61,14 +66,18 @@ def scan_tau(pools, number_of_agents, grid, min_mass=0.02):
         rep = markov.certify(P)
         pi = rep["stationary"]
         H = -float(np.sum(pi[pi > 0] * np.log(pi[pi > 0])))
-        mix = rep["tv_mixing_bound"]
+        # Select on the bound that actually applies to a run started anywhere,
+        # i.e. including the time to reach the recurrent class -- not just the
+        # mixing time once inside it.
+        mix = rep["tv_mixing_bound_total"]
         rungs = int((pi >= min_mass).sum())
         ok = (rep["unique_invariant_measure"] and rep["aperiodic"]
               and rungs >= 2 and np.isfinite(mix))
         rows.append((tau, rep, H, mix, pi, ok, rungs))
         print(f"{tau:6.2f} {str(rep['unique_invariant_measure']):>5} "
               f"{str(rep['aperiodic']):>5} {rep['doeblin_epsilon']:7.4f} "
-              f"{str(rep['doeblin_power']):>3} {mix:7.0f} {H:6.3f} {rungs:7d}  "
+              f"{str(rep['doeblin_power']):>3} {rep['tv_mixing_bound']:8.0f} "
+              f"{mix:6.0f} {H:6.3f} {rungs:7d}  "
               f"{np.round(pi, 3).tolist()}{'' if ok else '  (rejected)'}")
 
     viable = [r for r in rows if r[5]]
@@ -131,15 +140,15 @@ def main():
     print(f"P(-> more positive | k) = {np.round(dn, 4).tolist()}")
 
     paths, sentiments, terminal = {}, {}, {}
-    for lvl in args.initial_levels:
+    for start_level in args.initial_levels:
         lp, sp = [], []
         for r in range(args.runs):
-            levels, sents = simulate(pools, args, lvl, seed=args.seed + 10_000 * lvl + r)
+            levels, sents = simulate(pools, args, start_level, seed=args.seed + 10_000 * start_level + r)
             lp.append(levels); sp.append(sents)
-        paths[lvl] = lp; sentiments[lvl] = sp
-        terminal[lvl] = np.array([s[-1] for s in sp])
+        paths[start_level] = lp; sentiments[start_level] = sp
+        terminal[start_level] = np.array([s[-1] for s in sp])
         occ = markov.occupation_measure(lp, n_levels, burn_in=args.burn_in)
-        print(f"\ninitial level {lvl}: occupation {np.round(occ, 4).tolist()}")
+        print(f"\ninitial level {start_level}: occupation {np.round(occ, 4).tolist()}")
 
     all_paths = [p for lvl in args.initial_levels for p in paths[lvl]]
     P_hat, counts = markov.estimate_transition_matrix(all_paths, n_levels)
@@ -154,9 +163,9 @@ def main():
     print(markov.format_report(report))
 
     pi = report["stationary"]
-    for lvl in args.initial_levels:
-        occ = markov.occupation_measure(paths[lvl], n_levels, burn_in=args.burn_in)
-        print(f"TV(occupation | k0={lvl}, pi) = {markov.tv_distance(occ, pi):.4f}")
+    for start_level in args.initial_levels:
+        occ = markov.occupation_measure(paths[start_level], n_levels, burn_in=args.burn_in)
+        print(f"TV(occupation | k0={start_level}, pi) = {markov.tv_distance(occ, pi):.4f}")
     if len(args.initial_levels) >= 2:
         a, b = args.initial_levels[0], args.initial_levels[-1]
         occ_a = markov.occupation_measure(paths[a], n_levels, burn_in=args.burn_in)
@@ -173,8 +182,8 @@ def main():
     ax_path, ax_kde, ax_pi = axes
     ax_kde.sharey(ax_path)
 
-    for lvl in args.initial_levels[:2]:
-        ax_path.plot(sentiments[lvl][0], lw=1.2, alpha=0.9, label=f"$k_0$={lvl}")
+    for start_level in args.initial_levels[:2]:
+        ax_path.plot(sentiments[start_level][0], lw=1.2, alpha=0.9, label=f"$k_0$={start_level}")
     ax_path.axhline(0.0, color="k", lw=0.9)
     ax_path.axhspan(-args.tau, args.tau, color="tab:green", alpha=0.13)
     ax_path.set_ylim(-1.05, 1.05)
@@ -184,9 +193,9 @@ def main():
 
     grid = np.arange(-1.05, 1.05 + 1e-9, 0.005)
     dens = {}
-    for lvl in args.initial_levels:
-        dens[lvl] = kernel_density_distribution(grid, terminal[lvl], args.bandwidth)
-        ax_kde.plot(dens[lvl], grid, lw=1.8, label=f"$k_0$ = {lvl}")
+    for start_level in args.initial_levels:
+        dens[start_level] = kernel_density_distribution(grid, terminal[start_level], args.bandwidth)
+        ax_kde.plot(dens[start_level], grid, lw=1.8, label=f"$k_0$ = {start_level}")
     ax_kde.axhline(0.0, color="k", lw=0.9, ls=":")
     ax_kde.set_title(f"Invariant measure\n(KDE, h={args.bandwidth})")
     ax_kde.set_xlabel("density"); ax_kde.legend(fontsize=8); ax_kde.grid(alpha=0.3)
@@ -211,9 +220,9 @@ def main():
         step = grid[1] - grid[0]
         print(f"TV between sentiment KDEs (k0={a} vs {b}) = "
               f"{0.5 * float(np.abs(dens[a] - dens[b]).sum() * step):.4f}")
-    for lvl in args.initial_levels:
-        t = terminal[lvl]
-        print(f"terminal sentiment | k0={lvl}: mean={t.mean():+.4f} sd={t.std():.4f}")
+    for start_level in args.initial_levels:
+        t = terminal[start_level]
+        print(f"terminal sentiment | k0={start_level}: mean={t.mean():+.4f} sd={t.std():.4f}")
 
 
 if __name__ == "__main__":

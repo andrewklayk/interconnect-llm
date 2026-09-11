@@ -33,19 +33,14 @@ import torch
 # actuator's reach and the level simply pinned at the top rung.  A signed ladder
 # spans the reference, which is what makes regulation (and a non-degenerate
 # invariant measure) possible at all.
-# Rung 5 says "critical and disapproving", not plain "Be critical.": measured on
-# the 0.5B model, "Be critical." scored +0.649 -- more positive than rung 4 and on
-# a par with the neutral rung -- because it reads the word as "critical =
-# essential/crucial" and writes "provides an essential mode of urban mobility".
-# Rung 6 escapes the ambiguity only because "negative" disambiguates it.
 NEUTRALITY_LADDER = [
-    "Be extremely enthusiastic and positive.",
-    "Be positive.",
-    "Be mildly positive.",
+    "Be extremely enthusiastic and positive. Embody a real enthusiast of the topic.",
+    "Be mildly positive.", # switched places cause of the mean scores
+    "Be causually positive.",
     "Be strictly neutral, impersonal and factual. Use no evaluative or emotional language.",
-    "Be mildly critical.",
-    "Be critical and disapproving.",
-    "Be extremely critical and negative.",
+    "Be mildly critical and disapproving.",
+    "Be critical and disapproving. Embody someone who dislikes the topic.",
+    "Be extremely critical and negative. Embody a real hater of the topic.",
 ]
 
 NUM_LEVELS = len(NEUTRALITY_LADDER)
@@ -55,6 +50,7 @@ NUM_LEVELS = len(NEUTRALITY_LADDER)
 # not speak negatively about an intrinsically pleasant subject.  A mixed-valence
 # topic spans +0.88 to -0.75 and straddles the reference.
 BASE_PROMPT = "Write one short sentence about the public transport system."
+# BASE_PROMPT = "Write one short sentence about the color white."
 
 
 def render_prompt(level, base_prompt=BASE_PROMPT):
@@ -66,6 +62,30 @@ def render_prompt(level, base_prompt=BASE_PROMPT):
     level = int(np.clip(level, 0, NUM_LEVELS - 1))
     instruction = NEUTRALITY_LADDER[level]
     return base_prompt if not instruction else f"{base_prompt} {instruction}"
+
+
+# --- the naive one-sided ladder ------------------------------------------------
+# This is the design the PoC started from and the one that fails: the controller
+# has a single move, "append one more copy of the instruction", so the ladder is
+# unbounded above and has no rung on the negative side of the reference.  Kept in
+# the package because the failure is the point -- see examples/llm_poc/README.md.
+REPEAT_INSTRUCTION = "Be more neutral."
+
+
+def render_repeat_prompt(level, base_prompt=BASE_PROMPT):
+    """Base prompt followed by ``level`` verbatim copies of the instruction.
+
+    Unbounded in ``level``: there is no clipping here, which is exactly what lets
+    the closed-loop state escape to infinity.
+    """
+    level = max(0, int(level))
+    if level == 0:
+        return base_prompt
+    return f"{base_prompt} " + " ".join([REPEAT_INSTRUCTION] * level)
+
+
+#: Ladders addressable by name from the command line.
+LADDERS = {"signed": render_prompt, "repeat": render_repeat_prompt}
 
 
 def pick_device():
@@ -126,7 +146,8 @@ class LLMResponder:
     """
 
     def __init__(self, model_name="Qwen/Qwen2.5-0.5B-Instruct", device=None,
-                 temperature=1.0, top_p=0.95, max_new_tokens=32, seed=None):
+                 temperature=1.0, top_p=0.95, max_new_tokens=32, seed=None,
+                 render=None):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         assert temperature > 0, "temperature must be > 0 or the loop is deterministic"
@@ -134,13 +155,14 @@ class LLMResponder:
         self.temperature = temperature
         self.top_p = top_p
         self.max_new_tokens = max_new_tokens
+        self.render = render or render_prompt
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"  # required for batched decoder-only generation
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            model_name, dtype=torch.float16 if self.device == "cuda" else torch.float32
         )
         self.model.to(self.device).eval()
         if seed is not None:
@@ -149,7 +171,7 @@ class LLMResponder:
     @torch.inference_mode()
     def sample(self, level, n, base_prompt=BASE_PROMPT):
         """Draw ``n`` i.i.d. responses at instruction ``level``."""
-        prompt = render_prompt(level, base_prompt)
+        prompt = self.render(level, base_prompt)
         chat = [{"role": "user", "content": prompt}]
         text = self.tokenizer.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=True
@@ -207,26 +229,37 @@ class LLMAgentLogic(_BaseAgentLogic):
 class CachedLLMAgentLogic(_BaseAgentLogic):
     """Draws sentiment scores from precomputed per-level pools.
 
-    ``pools[k]`` is a 1-D array of i.i.d. sentiment scores observed at level
-    ``k``.  Sampling with replacement from that pool reproduces the conditional
-    law of the observation given the level, which is the only thing the loop
-    dynamics depend on.
+    ``pools[i]`` is a 1-D array of i.i.d. sentiment scores observed at ladder
+    level ``levels[i]``.  Sampling with replacement from that pool reproduces the
+    conditional law of the observation given the level, which is the only thing
+    the loop dynamics depend on.
+
+    ``levels`` defaults to ``0, 1, ..., len(pools)-1``, in which case the lookup
+    is the obvious one.  It matters for the unbounded ladder, where the state can
+    exceed every rung that was ever sampled: the pool of the *nearest probed*
+    rung is then used as a surrogate, which is sound precisely when the
+    conditional law has saturated -- the assumption
+    ``guarantees.transience.saturation_report`` exists to test.
     """
 
-    def __init__(self, pools, rng=None):
+    def __init__(self, pools, rng=None, levels=None):
         super().__init__()
         self.pools = [np.asarray(p, dtype=np.float64) for p in pools]
+        self.levels = (np.arange(len(self.pools)) if levels is None
+                       else np.asarray(levels, dtype=int))
         self.rng = rng if rng is not None else np.random.default_rng()
 
     @classmethod
     def from_npz(cls, path, rng=None):
         data = np.load(path)
-        pools = [data[f"level_{k}"] for k in range(int(data["num_levels"]))]
-        return cls(pools, rng=rng)
+        pools = [data[f"level_{i}"] for i in range(int(data["num_levels"]))]
+        levels = data["levels"] if "levels" in data.files else None
+        return cls(pools, rng=rng, levels=levels)
 
     def forward(self, values, number_of_agents):
         self.tensors["k"] = values["k"]
         level = int(round(float(values["k"].item())))
-        self.last_level = int(np.clip(level, 0, len(self.pools) - 1))
-        pool = self.pools[self.last_level]
+        i = int(np.argmin(np.abs(self.levels - level)))
+        self.last_level = int(self.levels[i])
+        pool = self.pools[i]
         return self._emit(self.rng.choice(pool, size=number_of_agents, replace=True))

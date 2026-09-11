@@ -157,6 +157,58 @@ def birth_death_stationary(P, tol=1e-12, states=None):
     return out
 
 
+def invariant_measures(P, tol=0.0):
+    """One invariant measure per closed class.
+
+    When there are several, the set of invariant measures is exactly the convex
+    hull of these: every ``sum_c a_c mu_c`` with ``a >= 0``, ``sum a_c = 1`` is
+    invariant, so the chain has a whole simplex of them and no ergodic theorem.
+    :func:`stationary_distribution` returns *an* invariant measure in that case --
+    whichever eigenvector the solver happens to return -- which is why
+    :func:`certify` checks the closed-class count before reporting one.
+    """
+    out = []
+    for cls in closed_classes(P, tol):
+        idx = np.array(sorted(cls))
+        local = stationary_distribution(np.nan_to_num(P, nan=0.0)[np.ix_(idx, idx)])
+        mu = np.zeros(P.shape[0])
+        mu[idx] = local
+        out.append(mu)
+    return out
+
+
+def absorption_probabilities(P, tol=0.0):
+    """``H[i, c] = P(the chain ends up in closed class c | it starts at i)``.
+
+    This is what "the limit depends on the initial condition" means quantitatively:
+    from a transient state the chain converges to a *random* one of the invariant
+    measures, and ``H[i]`` is the law of that choice.  Solves the harmonic system
+    ``(I - P_TT) h_T = P_TC 1`` on the transient states.
+
+    :return: ``(H, closed)`` with ``closed`` the list of closed classes, in the
+        column order of ``H``.
+    """
+    Pc = np.nan_to_num(P, nan=0.0)
+    closed = closed_classes(Pc, tol)
+    n = Pc.shape[0]
+    absorbed = set().union(*[set(c) for c in closed]) if closed else set()
+    transient = np.array([i for i in range(n) if i not in absorbed], dtype=int)
+    H = np.zeros((n, len(closed)))
+    for c, cls in enumerate(closed):
+        H[sorted(cls), c] = 1.0
+    if transient.size:
+        A = np.eye(transient.size) - Pc[np.ix_(transient, transient)]
+        for c, cls in enumerate(closed):
+            b = Pc[np.ix_(transient, np.array(sorted(cls)))].sum(axis=1)
+            H[transient, c] = np.linalg.solve(A, b)
+    # The solve can return -1e-17 for an unreachable class; clip, and squash the
+    # resulting negative zero, so the report does not print "-0.0" for a
+    # probability (np.clip leaves -0.0 alone -- it is not less than 0.0).
+    H = np.clip(H, 0.0, 1.0)
+    H[H == 0.0] = 0.0
+    return H, closed
+
+
 def doeblin_epsilon(P, max_power=12, criterion="mixing", target=0.01, form="sum"):
     """Best Doeblin minorization over powers of ``P``.
 
@@ -203,7 +255,11 @@ def doeblin_epsilon(P, max_power=12, criterion="mixing", target=0.01, form="sum"
             if criterion == "epsilon":
                 score = -eps
             else:
-                score = m * np.log(target) / np.log(1.0 - min(eps, 1 - 1e-15))
+                # log1p, not log(1 - eps): for a tiny eps -- which is exactly
+                # what a near-reducible chain produces -- 1.0 - eps rounds to 1.0
+                # and log gives 0, so the score becomes -inf and the search picks
+                # the most degenerate minorization on offer.
+                score = m * np.log(target) / np.log1p(-min(eps, 1 - 1e-15))
             if score < best_score:
                 best, best_score = (eps, m, nu), score
         M = M @ Pc
@@ -268,7 +324,44 @@ def mixing_time_bound(eps, m, target=0.01):
         return np.inf
     if eps >= 1:
         return m
-    return m * np.ceil(np.log(target) / np.log(1.0 - eps))
+    return m * np.ceil(np.log(target) / np.log1p(-eps))
+
+
+def expected_hitting_times(P, recurrent):
+    """Expected steps to reach the recurrent class, from each transient state.
+
+    ``(I - P_TT)^-1 1``.  Returns a full-length vector with zeros on the recurrent
+    class.
+    """
+    Pc = np.nan_to_num(P, nan=0.0)
+    n = Pc.shape[0]
+    T = np.array([i for i in range(n) if i not in set(recurrent)], dtype=int)
+    out = np.zeros(n)
+    if T.size:
+        out[T] = np.linalg.solve(np.eye(T.size) - Pc[np.ix_(T, T)], np.ones(T.size))
+    return out
+
+
+def absorption_time_bound(P, recurrent, target=0.005, max_steps=100000):
+    """Smallest ``t`` with ``P_x(not yet in the recurrent class after t) <= target``
+    for every ``x``.
+
+    Computed by iterating the sub-stochastic block directly rather than through a
+    spectral bound, which keeps it exact and cheap for these sizes.  Returns
+    ``inf`` if the tail has not fallen below ``target`` within ``max_steps``.
+    """
+    Pc = np.nan_to_num(P, nan=0.0)
+    n = Pc.shape[0]
+    T = np.array([i for i in range(n) if i not in set(recurrent)], dtype=int)
+    if T.size == 0:
+        return 0
+    Q = Pc[np.ix_(T, T)]
+    v = np.ones(T.size)
+    t = 0
+    while v.max() > target and t < max_steps:
+        v = Q @ v
+        t += 1
+    return t if v.max() <= target else np.inf
 
 
 def wilson_lower_bound(successes, trials, z=1.96):
@@ -322,6 +415,8 @@ def certify(P, counts=None, max_power=12, tv_target=0.01):
     else:
         nu = np.zeros(P.shape[0]); nu[idx] = nu_local; j = int(idx[np.argmax(nu_local)])
     pi = stationary_distribution(P) if closed else None
+    measures = invariant_measures(P) if len(closed) > 1 else None
+    absorption = absorption_probabilities(P)[0] if len(closed) > 1 else None
     report = {
         "irreducible": irreducible,
         "communicating_classes": classes,
@@ -343,7 +438,30 @@ def certify(P, counts=None, max_power=12, tv_target=0.01):
         "tv_mixing_bound": mixing_time_bound(eps, m, tv_target) if eps > 0 else np.inf,
         "stationary": pi,
         "stationary_birth_death": birth_death_stationary(P, states=recurrent),
+        # Only populated when uniqueness fails; the invariant set is then the
+        # convex hull of these, and `absorption[i, c]` says which one a
+        # trajectory started at `i` ends up under.
+        "invariant_measures": measures,
+        "absorption": absorption,
     }
+    # The Doeblin bound above is a bound on mixing *within* the recurrent class.
+    # A trajectory started outside it has to get there first, and that leg can be
+    # far slower than the mixing -- decisively so on a near-reducible chain.  The
+    # honest total is the two legs at half the target each:
+    #   ||P^t(x,.) - pi|| <= P_x(tau_C > t_hit) + sup_{y in C} ||P^u(y,.) - pi||
+    if recurrent is not None and report["transient_states"]:
+        t_hit = absorption_time_bound(P, recurrent, target=tv_target / 2)
+        report["expected_hitting_times"] = expected_hitting_times(P, recurrent)
+        report["absorption_time_bound"] = t_hit
+        inner = mixing_time_bound(eps, m, tv_target / 2) if eps > 0 else np.inf
+        report["tv_mixing_bound_total"] = t_hit + inner
+        report["dobrushin_mixing_bound_total"] = t_hit + dobrushin_mixing(
+            sub, max_power=max_power, target=tv_target / 2)[2]
+    else:
+        report["expected_hitting_times"] = None
+        report["absorption_time_bound"] = 0
+        report["tv_mixing_bound_total"] = report["tv_mixing_bound"]
+        report["dobrushin_mixing_bound_total"] = report["dobrushin_mixing_bound"]
     if counts is not None and eps > 0:
         # Honest uncertainty on the minorization: the binding row is the one that
         # attains the column minimum at m = 1.
@@ -369,20 +487,42 @@ def format_report(report, num_states=None):
     verdict = "UNIQUE" if r["unique_invariant_measure"] else "NOT UNIQUE"
     lines.append(f"invariant measure     : {verdict} "
                  f"({len(r['closed_classes'])} closed class(es))")
+    if r.get("invariant_measures") is not None:
+        lines.append(f"  the invariant set is the convex hull of "
+                     f"{len(r['invariant_measures'])} extreme measures:")
+        for c, mu in enumerate(r["invariant_measures"]):
+            lines.append(f"    mu_{c} on {r['closed_classes'][c]}: "
+                         f"{np.round(mu, 4).tolist()}")
+        lines.append("  absorption probabilities P(class | start):")
+        for i, row in enumerate(r["absorption"]):
+            lines.append(f"    from state {i}: {np.round(row, 4).tolist()}")
     if r["doeblin_epsilon"] > 0:
         lines.append(f"Doeblin minorization  : eps={r['doeblin_epsilon']:.4f} at m={r['doeblin_power']}"
                      f"  (nu peaks at state {r['doeblin_state']})")
         if "doeblin_epsilon_lcb" in r:
             lines.append(f"  eps 95% lower bound : {r['doeblin_epsilon_lcb']:.4f} "
                          f"(binding state i={r['doeblin_binding_state']})")
-        lines.append(f"  => uniformly ergodic, TV<0.01 within ~{r['tv_mixing_bound']:.0f} iterations")
+        lines.append(f"  => uniformly ergodic, TV<0.01 within ~{r['tv_mixing_bound']:.0f} "
+                     f"iterations once in the recurrent class")
+        if r.get("absorption_time_bound"):
+            hit = r["expected_hitting_times"]
+            lines.append(f"  reaching the recurrent class: <= {r['absorption_time_bound']:.0f} "
+                         f"iterations to 0.005 (expected {np.nanmax(hit):.1f} from the "
+                         f"worst transient state)")
+            lines.append(f"  => TV<0.01 from ANY start within ~{r['tv_mixing_bound_total']:.0f} "
+                         f"iterations")
         lines.append(f"Dobrushin coefficient : delta(P^{r['dobrushin_power']})="
                      f"{r['dobrushin_delta']:.4f}  => TV<0.01 within "
-                     f"~{r['dobrushin_mixing_bound']:.0f} iterations (sharpest)")
+                     f"~{r['dobrushin_mixing_bound']:.0f} iterations in the class, "
+                     f"~{r['dobrushin_mixing_bound_total']:.0f} from any start (sharpest)")
     else:
         lines.append("Doeblin minorization  : NONE FOUND (no uniform ergodicity)")
     if r["stationary"] is not None:
-        lines.append(f"stationary pi         : {np.round(r['stationary'], 4).tolist()}")
+        label = ("stationary pi         : " if r["unique_invariant_measure"]
+                 else "an invariant pi       : ")
+        lines.append(f"{label}{np.round(r['stationary'], 4).tolist()}"
+                     + ("" if r["unique_invariant_measure"]
+                        else "   <- one of many; see the extreme measures above"))
         bd = r["stationary_birth_death"]
         if bd is not None:
             lines.append(f"  birth-death closed form: {np.round(bd, 4).tolist()}")
