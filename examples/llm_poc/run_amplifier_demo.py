@@ -108,9 +108,13 @@ def main():
     pools, meta = load_pools(args.pools)
     n_levels = len(pools)
 
+    print(f"\n{RULE}")
+    means = []
     for lvl in range(n_levels):
-        print(f"Mean sentiment for k0 = {lvl}: {pools[lvl].mean()}")
-
+        means.append(pools[lvl].mean())
+        print(f"Mean sentiment for k0 = {lvl}: {means[-1]}")
+    print(f"Mean sentiment overall: {np.mean(means)}")
+    print(RULE)
     # ---- 0. the change ------------------------------------------------------
     print(RULE)
     print("0. ONE SIGN")
@@ -127,7 +131,7 @@ def main():
     print("\namplifying transition matrix:")
     print(np.round(P_amp, 3))
 
-    # ---- 1. the symmetric band: unique, and useless -------------------------
+    # ---- 1. the symmetric band: unique -------------------------
     print("\n" + RULE)
     print("1. WITH THE DEAD ZONE ON THE REFERENCE: STILL UNIQUELY ERGODIC")
     print(RULE)
@@ -173,14 +177,6 @@ def main():
         args.tau_offset = min(broke)
         print(f"\nsmallest offset at which uniqueness fails: {args.tau_offset:+.2f} "
               f"-- using that below")
-
-    print("\nNote what the offset is and is not doing.  It does not repair the positive")
-    print("feedback; it removes the accident that was masking it.  The plant's bias was")
-    print("the only thing keeping the critical end leaky, and therefore the only thing")
-    print("propping uniqueness up, so correcting for the bias -- the textbook-correct")
-    print("response to a biased sensor -- is what exposes the bistability the sign error")
-    print("had put there all along.  On the corrective loop the same offset buys nothing")
-    print("a symmetric band does not already have, which is why run_demo.py keeps one.")
 
     # ---- 3. the bistable regime ---------------------------------------------
     print("\n" + RULE)
@@ -275,7 +271,7 @@ def main():
             P_eps[k, max(k - 1, 0)] += u_eps[k]
             P_eps[k, min(k + 1, n_levels - 1)] += d_eps[k]
             P_eps[k, k] += 1.0 - u_eps[k] - d_eps[k]
-        rep_eps = markov.certify(P_eps, max_power=400)
+        rep_eps = markov.certify(P_eps, max_power=800)
         meta_rows.append((eps, rep_eps["tv_mixing_bound_total"]))
         print(f"{eps:12.0e} {str(rep_eps['unique_invariant_measure']):>7} "
               f"{rep_eps['doeblin_epsilon']:12.3g} {rep_eps['tv_mixing_bound_total']:15.3g} "
