@@ -4,18 +4,19 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
+import numpy as np
 
 
 
 id2label = {0: "negative", 1: "positive"}
 label2id = {"negative": 0, "positive": 1}
 
-MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 DATASET = "fancyzhx/amazon_polarity"
 BATCH_SIZE = 256
-TOTAL_SIZE = 60000
-TRAIN_SIZE = 50000
-TEST_SIZE = 10000
+TOTAL_SIZE = 10000
+TRAIN_SIZE = 9000
+TEST_SIZE = 1000
 
 def filename_from_str(st):
     return st.split("/")[1].replace("/","").replace("-", "").replace(".", "")
@@ -30,20 +31,35 @@ print(f"dataset loaded: {DATASET}")
 
 tok = AutoTokenizer.from_pretrained(MODEL)
 # take a smaller sample
+print("subsampling...")
 subsample = dataset["train"].train_test_split(
     train_size=TOTAL_SIZE, stratify_by_column="label", seed=0)["train"]
 
+print("splitting...")
 train_val_split = subsample.train_test_split(
     train_size=TRAIN_SIZE, stratify_by_column="label", seed=0)
 tokenized_dataset = train_val_split
-tokenized_dataset["train"] = train_val_split["train"].map(lambda x: tok(x["title"], truncation=True), batched=True)
-print("a")
-tokenized_dataset["validation"] = train_val_split["test"].map(lambda x: tok(x["title"], truncation=True), batched=True)
-print("a")
+
+print("tokenizing...")
+rng = np.random.default_rng(0)
+def tokenize_cut(x):
+    # cut at a random length: the loop's fixed-length responses often end mid-clause
+    ids = tok(x["content"])["input_ids"][:rng.integers(10, 41)]
+    return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+tokenized_dataset["train"] = train_val_split["train"].map(tokenize_cut)
+tokenized_dataset["validation"] = train_val_split["test"].map(tokenize_cut)
 if TEST_SIZE is not None:
     tokenized_dataset["test"] = dataset["test"].train_test_split(
         train_size=TEST_SIZE, stratify_by_column="label", seed=0)["train"]
-tokenized_dataset["test"] = tokenized_dataset["test"].map(lambda x: tok(x["title"], truncation=True), batched=True)
+else:
+    tokenized_dataset["test"] = dataset["test"]
+tokenized_dataset["test"] = tokenized_dataset["test"].map(tokenize_cut)
+
+print("saving to file...")
+tokenized_dataset['train'].save_to_disk("./amazon_polarity_content_mean/train/")
+tokenized_dataset['validation'].save_to_disk("./amazon_polarity_content_mean/validation/")
+tokenized_dataset['test'].save_to_disk("./amazon_polarity_content_mean/test/")
 
 print(f"dataset split and tokenized:\n {tokenized_dataset}")
 
@@ -60,7 +76,7 @@ print(device)
 model.to(device)
 
 cols = ["input_ids", "attention_mask", "label"]  # collator renames label -> labels
-train_dl = DataLoader(tokenized_dataset["train"].select_columns(cols), batch_size=BATCH_SIZE, shuffle=True, collate_fn=data_collator)
+train_dl = DataLoader(tokenized_dataset["train"].select_columns(cols), batch_size=BATCH_SIZE, collate_fn=data_collator)
 val_dl = DataLoader(tokenized_dataset["validation"].select_columns(cols), batch_size=BATCH_SIZE, collate_fn=data_collator)
 test_dl = DataLoader(tokenized_dataset["test"].select_columns(cols), batch_size=BATCH_SIZE, collate_fn=data_collator)
 
@@ -76,20 +92,16 @@ def extract_llm_features(dataloader):
     with torch.inference_mode():
         for batch in tqdm(dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
-            # shape [B, L, 768]
-            batch_last_hidden_states = model.base_model(**batch).last_hidden_state
-            # find the index of the last non-padding token so we get the state after it
-            batch_last_nonpadding_token_idxs = batch['attention_mask'].sum(1) - 1
-            # shape [L, 768]
-            for per_sentence_last_hidden_states, last_nonpadding_token_idx in zip(batch_last_hidden_states, batch_last_nonpadding_token_idxs):
-                per_sentence_transformer_feats.append(
-                    per_sentence_last_hidden_states[last_nonpadding_token_idx]
-                )
+            # shape [B, L, d]
+            H = model.base_model(**batch).last_hidden_state
+            # mean over real tokens: less sensitive to where the text is cut than the last state
+            m = batch['attention_mask'].unsqueeze(-1)
+            per_sentence_transformer_feats.append((H * m).sum(1) / m.sum(1))
             labels.append(batch['labels'])
     return per_sentence_transformer_feats, labels
 
 
-saved_feats_path = os.path.join("saved_features", filename_from_str(DATASET), filename_from_str(MODEL))
+saved_feats_path = os.path.join("saved_features", filename_from_str(DATASET) + "_content_mean", filename_from_str(MODEL))
 os.makedirs(saved_feats_path, exist_ok=True)
 print(f"Path ready: will be saved as {saved_feats_path}/*.pt")
 
