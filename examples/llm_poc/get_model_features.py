@@ -1,27 +1,19 @@
 import datasets
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding
+from transformers import AutoModel, AutoTokenizer, DataCollatorWithPadding
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import os
 import numpy as np
 
+from common import MODEL, FEAT_DIR, DATA
 
-
-id2label = {0: "negative", 1: "positive"}
-label2id = {"negative": 0, "positive": 1}
-
-MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 DATASET = "fancyzhx/amazon_polarity"
-BATCH_SIZE = 256
-TOTAL_SIZE = 10000
-TRAIN_SIZE = 9000
+BATCH_SIZE = 200
+TOTAL_SIZE = 6000
+TRAIN_SIZE = 5000
 TEST_SIZE = 1000
 
-def filename_from_str(st):
-    return st.split("/")[1].replace("/","").replace("-", "").replace(".", "")
-
-model = AutoModelForSequenceClassification.from_pretrained(MODEL, num_labels=2, id2label=id2label, label2id=label2id, dtype=torch.float32)
+model = AutoModel.from_pretrained(MODEL, dtype=torch.float32)
 
 print(f"model loaded: {MODEL}")
 
@@ -41,34 +33,32 @@ train_val_split = subsample.train_test_split(
 tokenized_dataset = train_val_split
 
 print("tokenizing...")
-rng = np.random.default_rng(0)
-def tokenize_cut(x):
-    # cut at a random length: the loop's fixed-length responses often end mid-clause
-    ids = tok(x["content"])["input_ids"][:rng.integers(10, 41)]
+def tokenize_cut(x, i):
+    # cut at a random length (seeded by row index, so map caching stays valid):
+    # the loop's fixed-length responses often end mid-clause
+    ids = tok(x["content"])["input_ids"][:np.random.default_rng(i).integers(10, 41)]
     return {"input_ids": ids, "attention_mask": [1] * len(ids)}
 
-tokenized_dataset["train"] = train_val_split["train"].map(tokenize_cut)
-tokenized_dataset["validation"] = train_val_split["test"].map(tokenize_cut)
+tokenized_dataset["train"] = train_val_split["train"].map(tokenize_cut, with_indices=True)
+tokenized_dataset["validation"] = train_val_split["test"].map(tokenize_cut, with_indices=True)
 if TEST_SIZE is not None:
     tokenized_dataset["test"] = dataset["test"].train_test_split(
         train_size=TEST_SIZE, stratify_by_column="label", seed=0)["train"]
 else:
     tokenized_dataset["test"] = dataset["test"]
-tokenized_dataset["test"] = tokenized_dataset["test"].map(tokenize_cut)
+tokenized_dataset["test"] = tokenized_dataset["test"].map(tokenize_cut, with_indices=True)
 
 print("saving to file...")
-tokenized_dataset['train'].save_to_disk("./amazon_polarity_content_mean/train/")
-tokenized_dataset['validation'].save_to_disk("./amazon_polarity_content_mean/validation/")
-tokenized_dataset['test'].save_to_disk("./amazon_polarity_content_mean/test/")
+tokenized_dataset['train'].save_to_disk(DATA / "amazon_polarity_content_mean" / "train")
+tokenized_dataset['validation'].save_to_disk(DATA / "amazon_polarity_content_mean" / "validation")
+tokenized_dataset['test'].save_to_disk(DATA / "amazon_polarity_content_mean" / "test")
 
 print(f"dataset split and tokenized:\n {tokenized_dataset}")
 
 # padding needed for minibatch training
 data_collator = DataCollatorWithPadding(tokenizer=tok)
 
-model.base_model.requires_grad_(False)
-model.score.requires_grad_(True)
-model.eval()   # score has no dropout, so eval on the whole model is fine
+model.eval()
 
 # device = "cuda" if torch.cuda.is_available() else "cpu"
 device = "cpu"
@@ -93,7 +83,7 @@ def extract_llm_features(dataloader):
         for batch in tqdm(dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
             # shape [B, L, d]
-            H = model.base_model(**batch).last_hidden_state
+            H = model(**batch).last_hidden_state
             # mean over real tokens: less sensitive to where the text is cut than the last state
             m = batch['attention_mask'].unsqueeze(-1)
             per_sentence_transformer_feats.append((H * m).sum(1) / m.sum(1))
@@ -101,9 +91,8 @@ def extract_llm_features(dataloader):
     return per_sentence_transformer_feats, labels
 
 
-saved_feats_path = os.path.join("saved_features", filename_from_str(DATASET) + "_content_mean", filename_from_str(MODEL))
-os.makedirs(saved_feats_path, exist_ok=True)
-print(f"Path ready: will be saved as {saved_feats_path}/*.pt")
+FEAT_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Path ready: will be saved as {FEAT_DIR}/*.pt")
 
 for subset, loader in loaders.items():
     print(f"Starting extraction: {subset}")
@@ -112,5 +101,5 @@ for subset, loader in loaders.items():
     scorer_feats = torch.vstack(scorer_feats)
     scorer_labels = torch.concat(scorer_labels)
     print(f"saving {subset}")
-    torch.save(scorer_feats, os.path.join(saved_feats_path, f"feat_{subset}.pt"))
-    torch.save(scorer_labels, os.path.join(saved_feats_path, f"labels_{subset}.pt"))
+    torch.save(scorer_feats, FEAT_DIR / f"feat_{subset}.pt")
+    torch.save(scorer_labels, FEAT_DIR / f"labels_{subset}.pt")
