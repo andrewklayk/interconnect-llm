@@ -107,6 +107,12 @@ class LLMSim(Simulation):
 
         self.controller_logic = cont.logic
         self.agent_logic = agent_logic
+        # Round 1's controller step runs before any response exists. Feeding back the hold band's centre makes
+        # it hold, so the chain starts at initial_level; with no feedback it would read s = 0 and could move.
+        self._hold_first = {"F": torch.tensor([-float(tau_offset) / loop_gain - float(reference_signal)])}
+
+    def run(self, iterations):
+        self.system.run(iterations, disable_tqdm=True, initial_outputs=self._hold_first)
 
     # -- convenience accessors -------------------------------------------------
     @property
